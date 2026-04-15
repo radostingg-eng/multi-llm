@@ -1,4 +1,4 @@
-"""Tests for rate-limit cooldown tracking."""
+"""Tests for cooldown tracking."""
 
 import os
 import time
@@ -6,17 +6,25 @@ import time
 
 class TestCooldowns:
     def test_fresh_key_available(self, mod):
-        cfg = {"keys": ["k"], "cooldowns": {}}
-        assert mod.is_available(cfg, 0) is True
+        cfg = {"gemini_keys": ["k"], "groq_keys": [], "cooldowns": {}}
+        assert mod.is_available(cfg, "gemini", 0) is True
 
     def test_just_limited_unavailable(self, mod):
-        cfg = {"keys": ["k"], "cooldowns": {"0": time.time()}}
-        assert mod.is_available(cfg, 0) is False
+        cfg = {"gemini_keys": ["k"], "groq_keys": [], "cooldowns": {"gemini:0": time.time()}}
+        assert mod.is_available(cfg, "gemini", 0) is False
 
     def test_expired_cooldown_available(self, mod):
         old = time.time() - mod.COOLDOWN_SECS - 1
-        cfg = {"keys": ["k"], "cooldowns": {"0": old}}
-        assert mod.is_available(cfg, 0) is True
+        cfg = {"gemini_keys": ["k"], "groq_keys": [], "cooldowns": {"gemini:0": old}}
+        assert mod.is_available(cfg, "gemini", 0) is True
+
+    def test_groq_cooldowns_independent(self, mod):
+        cfg = {
+            "gemini_keys": ["k"], "groq_keys": ["g"],
+            "cooldowns": {"gemini:0": time.time()},
+        }
+        assert mod.is_available(cfg, "gemini", 0) is False
+        assert mod.is_available(cfg, "groq", 0) is True
 
     def test_mark_limited_persists(self, mod, tmp_path, monkeypatch):
         cfg_dir = str(tmp_path / ".multi-llm")
@@ -24,11 +32,29 @@ class TestCooldowns:
         monkeypatch.setattr(mod, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(mod, "CONFIG_FILE", cfg_file)
 
-        cfg = {"keys": ["k"], "cooldowns": {}}
-        mod.mark_limited(cfg, 0)
-        assert "0" in cfg["cooldowns"]
-        assert "0" in mod.load_config()["cooldowns"]
+        cfg = {"gemini_keys": ["k"], "groq_keys": [], "cooldowns": {}}
+        mod.mark_limited(cfg, "gemini", 0)
+        loaded = mod.load_config()
+        assert "gemini:0" in loaded["cooldowns"]
 
     def test_status_line(self, mod):
-        cfg = {"keys": ["k1", "k2", "k3"], "cooldowns": {"0": time.time()}}
-        assert "2/3" in mod.status_line(cfg)
+        cfg = {
+            "gemini_keys": ["k1", "k2"],
+            "groq_keys": ["g1"],
+            "cooldowns": {"gemini:0": time.time()},
+        }
+        line = mod.status_line(cfg)
+        assert "Gemini: 1/2" in line
+        assert "Groq: 1/1" in line
+
+    def test_get_groq_key_returns_available(self, mod):
+        cfg = {"gemini_keys": [], "groq_keys": ["g1", "g2"], "cooldowns": {"groq:0": time.time()}}
+        key, idx = mod.get_groq_key(cfg)
+        assert key == "g2"
+        assert idx == 1
+
+    def test_get_groq_key_returns_none_when_exhausted(self, mod):
+        now = time.time()
+        cfg = {"gemini_keys": [], "groq_keys": ["g1"], "cooldowns": {"groq:0": now}}
+        key, idx = mod.get_groq_key(cfg)
+        assert key is None

@@ -10,7 +10,7 @@ class TestConfig:
         monkeypatch.setattr(mod, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(mod, "CONFIG_FILE", cfg_file)
 
-        cfg = {"keys": ["key1", "key2"], "cooldowns": {}}
+        cfg = {"gemini_keys": ["k1"], "groq_keys": ["g1"], "cooldowns": {}}
         mod.save_config(cfg)
         assert mod.load_config() == cfg
 
@@ -25,6 +25,5 @@ class TestConfig:
         cfg_file = os.path.join(cfg_dir, "config.json")
         monkeypatch.setattr(mod, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(mod, "CONFIG_FILE", cfg_file)
-
-        mod.save_config({"keys": []})
+        mod.save_config({"gemini_keys": [], "groq_keys": []})
         assert oct(os.stat(cfg_file).st_mode & 0o777) == "0o600"

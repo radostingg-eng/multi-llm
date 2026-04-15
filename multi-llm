@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-multi-llm — Rotate Gemini API keys and launch the native Gemini CLI.
-When one key hits its rate limit, exit and re-run — it picks the next key.
+multi-llm — Smart Gemini CLI launcher with Groq-powered extras.
+
+- Rotates Gemini API keys (launches real Gemini CLI)
+- Smart routing: simple questions answered instantly by Groq
+- Prompt enhancer: Groq rewrites your prompt before Gemini sees it
+- Quick-chat fallback: Groq chat when all Gemini keys are exhausted
+- Session memory: summarizes conversations for continuity
 """
 
 import json
@@ -9,11 +14,18 @@ import os
 import subprocess
 import sys
 import time
+import urllib.request
+import urllib.error
 
 # ─── paths ───────────────────────────────────────────────────────────────────
 CONFIG_DIR = os.path.expanduser("~/.multi-llm")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-COOLDOWN_SECS = 3600  # 1h cooldown after rate limit
+SUMMARY_FILE = os.path.join(CONFIG_DIR, "last_summary.txt")
+COOLDOWN_SECS = 3600
+
+# ─── Groq ────────────────────────────────────────────────────────────────────
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -36,80 +48,377 @@ def save_config(cfg):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  SETUP (runs once)
+#  SETUP
 # ═════════════════════════════════════════════════════════════════════════════
 
 def setup():
     print()
     print("  multi-llm — First-Time Setup")
     print()
-    print("  This tool rotates your free Gemini API keys and")
-    print("  launches the real Gemini CLI. When one key runs out,")
-    print("  exit and re-run — it picks the next key automatically.")
+    print("  This tool rotates your free API keys and launches the")
+    print("  real Gemini CLI. Simple questions get answered instantly")
+    print("  by Groq to save your Gemini quota.")
     print()
 
-    cfg = {"keys": [], "cooldowns": {}}
+    cfg = {"gemini_keys": [], "groq_keys": [], "cooldowns": {}}
 
-    # Auto-detect from environment
     for var in sorted(os.environ.keys()):
         if var.startswith("GEMINI_API_KEY"):
             val = os.environ[var].strip()
             if val:
-                cfg["keys"].append(val)
+                cfg["gemini_keys"].append(val)
+    for var in sorted(os.environ.keys()):
+        if var.startswith("GROQ_API_KEY"):
+            val = os.environ[var].strip()
+            if val:
+                cfg["groq_keys"].append(val)
 
-    if cfg["keys"]:
-        print("  Found %d Gemini key(s) in your environment." % len(cfg["keys"]))
+    found = len(cfg["gemini_keys"]) + len(cfg["groq_keys"])
+    if found:
+        print("  Found %d Gemini + %d Groq key(s) in your environment." % (
+            len(cfg["gemini_keys"]), len(cfg["groq_keys"])))
     else:
-        print("  No keys found in environment.")
-        print()
-        print("  Get a free key: https://aistudio.google.com/apikey")
-        print("    -> Click 'Create API Key' -> copy it (starts with AIza...)")
+        print("  No keys found. Get free keys:")
+        print("    Gemini: https://aistudio.google.com/apikey")
+        print("    Groq:   https://console.groq.com/keys")
         print()
         _add_keys_interactive(cfg)
 
-    if not cfg["keys"]:
-        print("  No keys added. Get one at https://aistudio.google.com/apikey")
+    if not cfg["gemini_keys"] and not cfg["groq_keys"]:
+        print("  No keys added.")
         sys.exit(1)
 
     save_config(cfg)
-    print("  Saved %d key(s)." % len(cfg["keys"]))
+    print("  Saved %d Gemini + %d Groq key(s)." % (
+        len(cfg["gemini_keys"]), len(cfg["groq_keys"])))
     print()
     return cfg
 
 
 def _add_keys_interactive(cfg):
-    print("  Paste your Gemini API key(s). Press Enter when done.")
+    print("  Paste keys one at a time. Press Enter when done.")
     print()
     while True:
-        key = input("  Key (or Enter to finish): ").strip()
-        if not key:
+        print("  [1] Gemini key   [2] Groq key   [enter] Done")
+        choice = input("  > ").strip()
+        if not choice:
+            if not cfg["gemini_keys"] and not cfg["groq_keys"]:
+                print("  Need at least one key!")
+                continue
             break
-        cfg["keys"].append(key)
-        print("  Added key #%d" % len(cfg["keys"]))
+        elif choice == "1":
+            key = input("  Gemini key: ").strip()
+            if key:
+                cfg["gemini_keys"].append(key)
+                print("  Added Gemini key #%d" % len(cfg["gemini_keys"]))
+        elif choice == "2":
+            key = input("  Groq key: ").strip()
+            if key:
+                cfg["groq_keys"].append(key)
+                print("  Added Groq key #%d" % len(cfg["groq_keys"]))
+        print()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  COOLDOWNS
 # ═════════════════════════════════════════════════════════════════════════════
 
-def is_available(cfg, idx):
-    ts = cfg.get("cooldowns", {}).get(str(idx), 0)
+def is_available(cfg, provider, idx):
+    key = "%s:%d" % (provider, idx)
+    ts = cfg.get("cooldowns", {}).get(key, 0)
     return time.time() - ts > COOLDOWN_SECS
 
 
-def mark_limited(cfg, idx):
-    cfg.setdefault("cooldowns", {})[str(idx)] = time.time()
+def mark_limited(cfg, provider, idx):
+    cfg.setdefault("cooldowns", {})["%s:%d" % (provider, idx)] = time.time()
     save_config(cfg)
 
 
 def status_line(cfg):
-    total = len(cfg.get("keys", []))
-    up = sum(1 for i in range(total) if is_available(cfg, i))
-    return "%d/%d keys ready" % (up, total)
+    g = len(cfg.get("gemini_keys", []))
+    g_up = sum(1 for i in range(g) if is_available(cfg, "gemini", i))
+    q = len(cfg.get("groq_keys", []))
+    q_up = sum(1 for i in range(q) if is_available(cfg, "groq", i))
+    parts = []
+    if g:
+        parts.append("Gemini: %d/%d" % (g_up, g))
+    if q:
+        parts.append("Groq: %d/%d" % (q_up, q))
+    return "  ".join(parts) if parts else "No keys"
+
+
+def get_groq_key(cfg):
+    """Return first available Groq key, or None."""
+    for i, key in enumerate(cfg.get("groq_keys", [])):
+        if is_available(cfg, "groq", i):
+            return key, i
+    return None, None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  LAUNCH
+#  GROQ API (used by all smart features)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def groq_call(api_key, messages, stream=False):
+    """Call Groq API. Returns (text, error_code). error_code 0 = success."""
+    payload = json.dumps({
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "stream": stream,
+    }).encode()
+
+    req = urllib.request.Request(GROQ_URL, data=payload, headers={
+        "Authorization": "Bearer %s" % api_key,
+        "Content-Type": "application/json",
+        "User-Agent": "multi-llm/1.0",
+    })
+
+    try:
+        resp = urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            return None, 429
+        return None, e.code
+    except urllib.error.URLError:
+        return None, -1
+
+    if not stream:
+        data = json.loads(resp.read().decode())
+        return data["choices"][0]["message"]["content"], 0
+
+    # Streaming
+    full = []
+    for line in resp:
+        line = line.decode().strip()
+        if not line.startswith("data: "):
+            continue
+        d = line[6:]
+        if d == "[DONE]":
+            break
+        try:
+            c = json.loads(d)["choices"][0].get("delta", {}).get("content", "")
+            if c:
+                print(c, end="", flush=True)
+                full.append(c)
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
+    print()
+    return "".join(full), 0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  FEATURE 1: SMART ROUTING
+# ═════════════════════════════════════════════════════════════════════════════
+
+def route_query(cfg, query):
+    """Use Groq to decide: can this be answered without Gemini CLI tools?
+    Returns 'simple' or 'complex'."""
+    groq_key, _ = get_groq_key(cfg)
+    if not groq_key:
+        return "complex"  # no Groq keys, just use Gemini
+
+    result, code = groq_call(groq_key, [{
+        "role": "user",
+        "content": (
+            "You are a router. Decide if this question needs file access, "
+            "code editing, terminal commands, or browsing (reply COMPLEX), "
+            "or if it's a general knowledge/conversational question that can "
+            "be answered from memory (reply SIMPLE). Reply with ONLY the word "
+            "SIMPLE or COMPLEX.\n\nQuestion: %s" % query
+        ),
+    }])
+
+    if code != 0 or not result:
+        return "complex"
+    return "simple" if "SIMPLE" in result.upper() else "complex"
+
+
+def groq_answer(cfg, query):
+    """Answer a simple question with Groq (streaming). Returns True if answered."""
+    groq_key, idx = get_groq_key(cfg)
+    if not groq_key:
+        return False
+
+    # Load previous summary for context
+    context = load_summary()
+    messages = []
+    if context:
+        messages.append({
+            "role": "system",
+            "content": "Previous conversation summary: %s" % context,
+        })
+    messages.append({"role": "user", "content": query})
+
+    print()
+    text, code = groq_call(groq_key, messages, stream=True)
+
+    if code == 429:
+        mark_limited(cfg, "groq", idx)
+        return False
+    return code == 0 and bool(text)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  FEATURE 2: PROMPT ENHANCER
+# ═════════════════════════════════════════════════════════════════════════════
+
+def enhance_prompt(cfg, query):
+    """Use Groq to rewrite the prompt for better Gemini results."""
+    groq_key, _ = get_groq_key(cfg)
+    if not groq_key:
+        return query  # no Groq, use original
+
+    result, code = groq_call(groq_key, [{
+        "role": "user",
+        "content": (
+            "Rewrite this prompt to be clearer and more specific for an AI "
+            "coding assistant. Keep the same intent but make it unambiguous. "
+            "Return ONLY the rewritten prompt, nothing else.\n\n"
+            "Original: %s" % query
+        ),
+    }])
+
+    if code == 0 and result and len(result) < len(query) * 5:
+        return result.strip()
+    return query  # fallback to original
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  FEATURE 3: GROQ QUICK-CHAT FALLBACK
+# ═════════════════════════════════════════════════════════════════════════════
+
+def groq_quick_chat(cfg):
+    """Basic Groq chat when all Gemini keys are exhausted."""
+    groq_key, groq_idx = get_groq_key(cfg)
+    if not groq_key:
+        return
+
+    # Calculate when next Gemini key is back
+    next_back = None
+    for i in range(len(cfg.get("gemini_keys", []))):
+        ts = cfg.get("cooldowns", {}).get("gemini:%d" % i, 0)
+        back_at = ts + COOLDOWN_SECS
+        if next_back is None or back_at < next_back:
+            next_back = back_at
+    mins_left = max(0, int((next_back - time.time()) / 60)) if next_back else "?"
+
+    print()
+    print("  Quick-chat mode (Groq) — text only, no tools/files")
+    if mins_left != "?":
+        print("  Gemini keys available again in ~%dm" % mins_left)
+    print("  Type 'quit' to exit")
+    print()
+
+    messages = []
+    context = load_summary()
+    if context:
+        messages.append({
+            "role": "system",
+            "content": "Previous conversation summary: %s" % context,
+        })
+
+    while True:
+        try:
+            user_input = input("> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if user_input.strip().lower() in ("quit", "exit"):
+            break
+        if not user_input.strip():
+            continue
+
+        messages.append({"role": "user", "content": user_input})
+        print()
+
+        text, code = groq_call(groq_key, messages, stream=True)
+        if code == 429:
+            mark_limited(cfg, "groq", groq_idx)
+            # Try next Groq key
+            groq_key, groq_idx = get_groq_key(cfg)
+            if groq_key:
+                print("  [switched Groq key]")
+                text, code = groq_call(groq_key, messages, stream=True)
+            else:
+                print("  All keys exhausted!")
+                break
+
+        if text:
+            messages.append({"role": "assistant", "content": text})
+        else:
+            messages.pop()
+        print()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  FEATURE 4: SESSION SUMMARY
+# ═════════════════════════════════════════════════════════════════════════════
+
+def load_summary():
+    """Load last session summary if it exists."""
+    if os.path.exists(SUMMARY_FILE):
+        with open(SUMMARY_FILE) as f:
+            return f.read().strip()
+    return None
+
+
+def save_summary(text):
+    """Save session summary."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(SUMMARY_FILE, "w") as f:
+        f.write(text)
+
+
+def summarize_session(cfg):
+    """After Gemini exits, use Groq to summarize what happened."""
+    groq_key, _ = get_groq_key(cfg)
+    if not groq_key:
+        return
+
+    # Read Gemini CLI's latest session history
+    history_dir = os.path.expanduser("~/.gemini/history")
+    if not os.path.isdir(history_dir):
+        return
+
+    # Find most recent session file
+    files = sorted(
+        [os.path.join(history_dir, f) for f in os.listdir(history_dir)],
+        key=lambda f: os.path.getmtime(f) if os.path.isfile(f) else 0,
+        reverse=True,
+    )
+    if not files:
+        return
+
+    try:
+        with open(files[0]) as f:
+            history = f.read()
+    except Exception:
+        return
+
+    if len(history) < 100:
+        return  # too short to summarize
+
+    # Truncate if very long (keep last 4000 chars)
+    if len(history) > 4000:
+        history = "...\n" + history[-4000:]
+
+    print("  Saving session summary for next time...")
+    result, code = groq_call(groq_key, [{
+        "role": "user",
+        "content": (
+            "Summarize this conversation in 2-3 sentences. Focus on what "
+            "was worked on and any decisions made:\n\n%s" % history
+        ),
+    }])
+
+    if code == 0 and result:
+        save_summary(result)
+        print("  Saved.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  LAUNCH GEMINI CLI
 # ═════════════════════════════════════════════════════════════════════════════
 
 def launch_gemini(api_key, extra_args):
@@ -126,7 +435,7 @@ def launch_gemini(api_key, extra_args):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  MAIN
+#  SELF-UPDATE
 # ═════════════════════════════════════════════════════════════════════════════
 
 def self_update():
@@ -139,23 +448,35 @@ def self_update():
         print("  Update failed.")
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═════════════════════════════════════════════════════════════════════════════
+
 def main():
     args = sys.argv[1:]
 
-    # Our flags
     if args and args[0] in ("--help", "-h"):
         print("""
-  multi-llm — Rotate Gemini API keys, launch native CLI
+  multi-llm — Smart Gemini CLI launcher
 
-  multi-llm              Launch Gemini CLI with next available key
-  multi-llm --status     Show which keys are ready
-  multi-llm --add        Add more keys
-  multi-llm --update     Pull latest version
-  multi-llm --reset      Clear all cooldowns
+  multi-llm                 Launch Gemini CLI (next available key)
+  multi-llm "question"      Smart route: Groq answers simple Qs instantly,
+                            complex ones go to Gemini with enhanced prompt
+  multi-llm --status        Show which keys are ready
+  multi-llm --add           Add more keys
+  multi-llm --update        Pull latest version
+  multi-llm --reset         Clear all cooldowns
+  multi-llm --no-enhance    Skip prompt enhancement for -p mode
 
-  Everything else passes to gemini:
+  Gemini CLI flags work too:
     multi-llm -p "explain this"
     multi-llm --model gemini-2.5-pro
+
+  Smart features (powered by Groq):
+    - Simple questions answered instantly (saves Gemini quota)
+    - Complex prompts rewritten for better results
+    - Quick-chat fallback when Gemini keys are exhausted
+    - Session summaries for conversation continuity
 """)
         return
 
@@ -178,40 +499,83 @@ def main():
 
     if args and args[0] == "--add":
         if not cfg:
-            cfg = {"keys": [], "cooldowns": {}}
+            cfg = {"gemini_keys": [], "groq_keys": [], "cooldowns": {}}
         _add_keys_interactive(cfg)
         save_config(cfg)
         return
 
-    # Pass everything else to gemini
-    extra_args = args
-
-    # First-time setup (only runs once)
+    # First-time setup
     if cfg is None:
         cfg = setup()
 
-    # Pick next available key and launch
     print("  %s" % status_line(cfg))
 
-    for i, key in enumerate(cfg.get("keys", [])):
-        if not is_available(cfg, i):
+    # ── Check for prompt mode: multi-llm "question" or multi-llm -p "question"
+    no_enhance = "--no-enhance" in args
+    args = [a for a in args if a != "--no-enhance"]
+
+    prompt = None
+    if args and args[0] == "-p" and len(args) > 1:
+        prompt = args[1]
+    elif args and not args[0].startswith("-"):
+        prompt = " ".join(args)
+
+    # ── Smart routing for prompt mode ──
+    if prompt:
+        route = route_query(cfg, prompt)
+
+        if route == "simple":
+            print("  [instant answer via Groq]")
+            if groq_answer(cfg, prompt):
+                print()
+                return
+            # Groq failed, fall through to Gemini
+
+        # Enhance the prompt before sending to Gemini
+        if not no_enhance:
+            enhanced = enhance_prompt(cfg, prompt)
+            if enhanced != prompt:
+                print("  [enhanced prompt]")
+                prompt = enhanced
+
+        # Build args for Gemini
+        args = ["-p", prompt]
+
+    # ── Load previous summary as context ──
+    summary = load_summary()
+    if summary and not args:
+        # Pass summary as initial context via prompt-interactive
+        args = ["-i", "Context from your last session: %s" % summary]
+
+    # ── Try each Gemini key ──
+    for i, key in enumerate(cfg.get("gemini_keys", [])):
+        if not is_available(cfg, "gemini", i):
             continue
 
-        print("  Using key #%d" % (i + 1))
+        print("  Using Gemini key #%d" % (i + 1))
         print()
-        exit_code = launch_gemini(key, extra_args)
+        exit_code = launch_gemini(key, args)
 
+        # Summarize after session
         if exit_code == 0:
+            summarize_session(cfg)
             return
 
         print()
         answer = input("  Rate limited? Try next key? (y/n): ").strip().lower()
         if answer == "y":
-            mark_limited(cfg, i)
+            mark_limited(cfg, "gemini", i)
             continue
         return
 
-    print("  All keys on cooldown! Add more: multi-llm --add")
+    # ── All Gemini keys exhausted → Groq quick-chat ──
+    groq_key, _ = get_groq_key(cfg)
+    if groq_key:
+        print()
+        print("  All Gemini keys on cooldown.")
+        groq_quick_chat(cfg)
+    else:
+        print("  All keys on cooldown! Add more: multi-llm --add")
 
 
 if __name__ == "__main__":

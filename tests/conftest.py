@@ -2,17 +2,18 @@
 Global test fixtures for multi-llm.
 
 Guardrails:
-- os.fork is blocked (no real CLI launches in tests)
-- subprocess.call is blocked (no real git/CLI calls)
+- os.fork is blocked (no real CLI launches)
+- subprocess.call is blocked (no real git calls)
+- urllib is blocked (no real API calls)
 """
 
 import os
+import urllib.request
 import pytest
 
 
 @pytest.fixture(autouse=True)
 def _block_fork(monkeypatch):
-    """Prevent tests from forking real CLI processes."""
     if hasattr(os, "fork"):
         monkeypatch.setattr(os, "fork", lambda: (_ for _ in ()).throw(
             RuntimeError("Test tried to fork — mock it!")))
@@ -20,14 +21,20 @@ def _block_fork(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _block_subprocess(monkeypatch):
-    """Prevent real subprocess calls."""
     import subprocess
     monkeypatch.setattr(subprocess, "call", lambda *a, **kw: 0)
 
 
+@pytest.fixture(autouse=True)
+def _block_http(monkeypatch):
+    def _blocked(*a, **kw):
+        raise RuntimeError("Test tried to make HTTP request — mock it!")
+    monkeypatch.setattr(urllib.request, "urlopen", _blocked)
+
+
 @pytest.fixture
 def mod():
-    """Import the multi-llm module for testing."""
+    """Import the multi-llm module."""
     import importlib.util
     import importlib.machinery
     filepath = os.path.join(os.path.dirname(__file__), "..", "multi-llm")
