@@ -14,6 +14,10 @@ import time
 import urllib.request
 import urllib.error
 
+# ─── platform ────────────────────────────────────────────────────────────────
+IS_WINDOWS = os.name == "nt"
+PROMPT = "> " if IS_WINDOWS else "\033[1;32m>\033[0m "
+
 # ─── paths ───────────────────────────────────────────────────────────────────
 CONFIG_DIR = os.path.expanduser("~/.multi-llm")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
@@ -65,7 +69,8 @@ def save_config(cfg):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
-    os.chmod(CONFIG_FILE, 0o600)
+    if os.name != "nt":
+        os.chmod(CONFIG_FILE, 0o600)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -74,24 +79,40 @@ def save_config(cfg):
 
 def setup():
     print()
-    print("  multi-llm — First-Time Setup")
-    print("  ─────────────────────────────")
+    print("  ╔═══════════════════════════════════════════╗")
+    print("  ║       multi-llm — First-Time Setup        ║")
+    print("  ╚═══════════════════════════════════════════╝")
     print()
-    print("  Add your API keys. You can mix Gemini and Groq keys.")
-    print("  More keys = more free requests before hitting limits.")
+    print("  Welcome! This tool lets you chat with AI using multiple")
+    print("  free API keys. When one key runs out of free requests,")
+    print("  it automatically switches to the next one.")
     print()
-    print("  Get keys:")
-    print("    Gemini: https://aistudio.google.com/apikey")
-    print("    Groq:   https://console.groq.com/keys")
+    print("  You'll need at least one API key to get started.")
+    print("  Both are free — you just need to sign up:")
+    print()
+    print("    Gemini (Google):  https://aistudio.google.com/apikey")
+    print("      1. Click 'Create API Key'")
+    print("      2. Copy the key (starts with 'AIza...')")
+    print()
+    print("    Groq:             https://console.groq.com/keys")
+    print("      1. Sign up / log in")
+    print("      2. Click 'Create API Key'")
+    print("      3. Copy the key (starts with 'gsk_...')")
+    print()
+    print("  Tip: Create keys with multiple accounts for more free usage!")
+    print()
+    print("  ── Step 1: Choose a passphrase ──")
+    print("  This encrypts your keys on disk so nobody else can read them.")
+    print("  You'll enter it each time you start multi-llm.")
     print()
 
-    passphrase = getpass.getpass("  Choose a passphrase to encrypt your keys: ")
+    passphrase = getpass.getpass("  Choose a passphrase: ")
     if not passphrase:
         print("  Passphrase cannot be empty.")
         sys.exit(1)
     confirm = getpass.getpass("  Confirm passphrase: ")
     if passphrase != confirm:
-        print("  Passphrases don't match.")
+        print("  Passphrases don't match. Run 'multi-llm' to try again.")
         sys.exit(1)
 
     # Store a check value so we can verify passphrase on login
@@ -100,43 +121,109 @@ def setup():
     cfg = {"keys": [], "cooldowns": {}, "check": check_value}
 
     print()
-    _add_keys_interactive(cfg, passphrase)
+    print("  ── Step 2: Add your API keys ──")
+
+    # Auto-detect keys from environment
+    imported = _import_env_keys(cfg, passphrase)
+    if imported:
+        print()
+        print("  Auto-detected %d key(s) from your environment:" % imported)
+        for i, entry in enumerate(cfg["keys"]):
+            print("    %d. %s" % (i + 1, entry["provider"]))
+        print()
+        add_more = input("  Add more keys manually? (y/n): ").strip().lower()
+        if add_more == "y":
+            print()
+            _add_keys_interactive(cfg, passphrase)
+    else:
+        print()
+        _add_keys_interactive(cfg, passphrase)
 
     if not cfg["keys"]:
-        print("  No keys added. Run 'multi-llm' again to set up.")
+        print()
+        print("  No keys added. You need at least one key to use multi-llm.")
+        print("  Run './multi-llm' again after getting a key from one of the links above.")
         sys.exit(1)
 
     save_config(cfg)
     print()
-    print("  Done! %d key(s) saved. Run 'multi-llm' to start." % len(cfg["keys"]))
+    print("  ── Setup complete! ──")
+    print("  Saved %d key(s) to ~/.multi-llm/config.json (encrypted)" % len(cfg["keys"]))
+    print()
+    print("  You're ready to go! Starting chat...")
     print()
     return cfg, passphrase
 
 
+def _import_env_keys(cfg, passphrase):
+    """Auto-detect API keys from environment variables."""
+    count = 0
+    # Scan GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3, ...
+    for var in sorted(os.environ.keys()):
+        if var.startswith("GEMINI_API_KEY"):
+            val = os.environ[var].strip()
+            if val:
+                cfg["keys"].append({
+                    "provider": "gemini",
+                    "encrypted": encrypt_key(val, passphrase),
+                })
+                count += 1
+    # Scan GROQ_API_KEY, GROQ_API_KEY_2, ...
+    for var in sorted(os.environ.keys()):
+        if var.startswith("GROQ_API_KEY"):
+            val = os.environ[var].strip()
+            if val:
+                cfg["keys"].append({
+                    "provider": "groq",
+                    "encrypted": encrypt_key(val, passphrase),
+                })
+                count += 1
+    return count
+
+
 def _add_keys_interactive(cfg, passphrase):
+    print("  Paste your keys one at a time. The input is hidden for security.")
+    print("  Press Enter with no key when you're done.")
+    print()
     while True:
-        print("  Key types:  [1] Gemini   [2] Groq   [q] Done")
+        print("  What type of key?  [1] Gemini   [2] Groq   [enter] Done adding")
         choice = input("  > ").strip().lower()
 
-        if choice in ("q", "quit", "done", ""):
+        if choice in ("", "q", "quit", "done"):
+            if not cfg["keys"]:
+                print("  (No keys added yet — add at least one to continue)")
+                again = input("  Try again? (y/n): ").strip().lower()
+                if again == "y":
+                    continue
             break
         elif choice == "1":
             provider = "gemini"
+            hint = "starts with 'AIza...'"
         elif choice == "2":
             provider = "groq"
+            hint = "starts with 'gsk_...'"
         else:
-            print("  Invalid choice.")
+            print("  Type 1, 2, or press Enter to finish.")
             continue
 
-        key = getpass.getpass("  Paste %s API key (hidden): " % provider)
+        key = getpass.getpass("  Paste your %s key (%s): " % (provider, hint))
         if not key.strip():
+            print("  Empty key — skipped.")
             continue
+
+        # Basic format validation
+        key = key.strip()
+        if provider == "gemini" and not key.startswith("AIza"):
+            print("  Warning: Gemini keys usually start with 'AIza'. Adding anyway.")
+        if provider == "groq" and not key.startswith("gsk_"):
+            print("  Warning: Groq keys usually start with 'gsk_'. Adding anyway.")
 
         cfg["keys"].append({
             "provider": provider,
-            "encrypted": encrypt_key(key.strip(), passphrase),
+            "encrypted": encrypt_key(key, passphrase),
         })
-        print("  Added %s key #%d" % (provider, sum(1 for k in cfg["keys"] if k["provider"] == provider)))
+        count = sum(1 for k in cfg["keys"] if k["provider"] == provider)
+        print("  Added %s key #%d" % (provider, count))
         print()
 
 
@@ -189,7 +276,10 @@ def gemini_stream(api_key, messages):
     payload = json.dumps({"contents": contents}).encode()
     url = GEMINI_URL % (GEMINI_MODEL, api_key)
 
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url, data=payload, headers={
+        "Content-Type": "application/json",
+        "User-Agent": "multi-llm/1.0",
+    })
 
     try:
         resp = urllib.request.urlopen(req)
@@ -242,6 +332,7 @@ def groq_stream(api_key, messages):
     req = urllib.request.Request(GROQ_URL, data=payload, headers={
         "Authorization": "Bearer %s" % api_key,
         "Content-Type": "application/json",
+        "User-Agent": "multi-llm/1.0",
     })
 
     try:
@@ -383,15 +474,19 @@ def main():
 
     # ── Chat loop ──
     print()
+    print("  ╔═══════════════════════════════════════════╗")
+    print("  ║              multi-llm chat               ║")
+    print("  ╚═══════════════════════════════════════════╝")
     print("  %s" % status_line(cfg))
-    print("  Type a message. 'quit' or Ctrl+C to exit.")
+    print()
+    print("  Commands:  /status  /help  quit")
     print()
 
     messages = []
 
     while True:
         try:
-            user_input = input("\033[1;32m❯\033[0m ")
+            user_input = input(PROMPT)
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -402,6 +497,18 @@ def main():
         if user_input.strip().lower() == "/status":
             cfg = load_config()  # reload in case cooldowns changed
             print("  " + status_line(cfg))
+            continue
+
+        if user_input.strip().lower() == "/help":
+            print("  Commands:")
+            print("    /status   Show how many keys are available")
+            print("    /help     This message")
+            print("    quit      Exit the chat")
+            print()
+            print("  How it works:")
+            print("    Your message is sent to the first available API key.")
+            print("    If that key is rate-limited, it automatically tries the next.")
+            print("    Gemini keys are tried first, then Groq as fallback.")
             continue
 
         if not user_input.strip():
