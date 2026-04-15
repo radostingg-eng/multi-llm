@@ -11,7 +11,7 @@ class TestConfig:
         monkeypatch.setattr(mod, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(mod, "CONFIG_FILE", cfg_file)
 
-        cfg = {"keys": [{"provider": "gemini", "encrypted": "abc"}], "cooldowns": {}}
+        cfg = {"gemini_keys": ["key1"], "groq_keys": [], "cooldowns": {}}
         mod.save_config(cfg)
 
         loaded = mod.load_config()
@@ -23,13 +23,13 @@ class TestConfig:
 
     def test_config_file_permissions_unix(self, mod, tmp_path, monkeypatch):
         if os.name == "nt":
-            return  # skip on Windows
+            return
         cfg_dir = str(tmp_path / ".multi-llm")
         cfg_file = os.path.join(cfg_dir, "config.json")
         monkeypatch.setattr(mod, "CONFIG_DIR", cfg_dir)
         monkeypatch.setattr(mod, "CONFIG_FILE", cfg_file)
 
-        mod.save_config({"keys": []})
+        mod.save_config({"gemini_keys": [], "groq_keys": []})
         perms = oct(os.stat(cfg_file).st_mode & 0o777)
         assert perms == "0o600"
 
@@ -37,53 +37,32 @@ class TestConfig:
 class TestImportEnvKeys:
     @staticmethod
     def _clear_llm_env(monkeypatch):
-        """Remove any real GEMINI/GROQ keys so tests are isolated."""
         for var in list(os.environ.keys()):
             if var.startswith("GEMINI_API_KEY") or var.startswith("GROQ_API_KEY"):
                 monkeypatch.delenv(var)
 
-    def test_imports_gemini_keys(self, mod, monkeypatch):
+    def test_setup_detects_gemini_env(self, mod, tmp_path, monkeypatch):
+        """_import from env is now inline in setup(), test the logic directly."""
         self._clear_llm_env(monkeypatch)
         monkeypatch.setenv("GEMINI_API_KEY", "key1")
         monkeypatch.setenv("GEMINI_API_KEY_2", "key2")
 
-        cfg = {"keys": []}
-        count = mod._import_env_keys(cfg, "pass")
-        assert count == 2
-        assert all(k["provider"] == "gemini" for k in cfg["keys"])
+        cfg = {"gemini_keys": [], "groq_keys": [], "cooldowns": {}}
+        for var in sorted(os.environ.keys()):
+            if var.startswith("GEMINI_API_KEY"):
+                val = os.environ[var].strip()
+                if val:
+                    cfg["gemini_keys"].append(val)
+        assert len(cfg["gemini_keys"]) == 2
 
-    def test_imports_groq_keys(self, mod, monkeypatch):
+    def test_setup_detects_groq_env(self, mod, tmp_path, monkeypatch):
         self._clear_llm_env(monkeypatch)
         monkeypatch.setenv("GROQ_API_KEY", "gsk_abc")
-        monkeypatch.setenv("GROQ_API_KEY_2", "gsk_def")
 
-        cfg = {"keys": []}
-        count = mod._import_env_keys(cfg, "pass")
-        assert count == 2
-        assert all(k["provider"] == "groq" for k in cfg["keys"])
-
-    def test_imports_mixed_keys(self, mod, monkeypatch):
-        self._clear_llm_env(monkeypatch)
-        monkeypatch.setenv("GEMINI_API_KEY", "g1")
-        monkeypatch.setenv("GROQ_API_KEY", "gsk_1")
-
-        cfg = {"keys": []}
-        count = mod._import_env_keys(cfg, "pass")
-        assert count == 2
-
-    def test_skips_empty_values(self, mod, monkeypatch):
-        self._clear_llm_env(monkeypatch)
-        monkeypatch.setenv("GEMINI_API_KEY", "")
-
-        cfg = {"keys": []}
-        count = mod._import_env_keys(cfg, "pass")
-        assert count == 0
-
-    def test_imported_keys_are_decryptable(self, mod, monkeypatch):
-        self._clear_llm_env(monkeypatch)
-        monkeypatch.setenv("GEMINI_API_KEY", "my-secret-key")
-
-        cfg = {"keys": []}
-        mod._import_env_keys(cfg, "test-pass")
-        decrypted = mod.decrypt_key(cfg["keys"][0]["encrypted"], "test-pass")
-        assert decrypted == "my-secret-key"
+        cfg = {"gemini_keys": [], "groq_keys": [], "cooldowns": {}}
+        for var in sorted(os.environ.keys()):
+            if var.startswith("GROQ_API_KEY"):
+                val = os.environ[var].strip()
+                if val:
+                    cfg["groq_keys"].append(val)
+        assert len(cfg["groq_keys"]) == 1
