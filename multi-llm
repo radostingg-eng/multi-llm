@@ -9,6 +9,7 @@ import getpass
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.request
@@ -110,19 +111,18 @@ def setup():
     print()
     print("  Tip: Create keys with multiple accounts for more free usage!")
     print()
-    print("  ── Step 1: Choose a passphrase ──")
-    print("  This encrypts your keys on disk so nobody else can read them.")
-    print("  You'll enter it each time you start multi-llm.")
+    print("  ── Step 1: Choose a passphrase (optional) ──")
+    print("  This encrypts your keys on disk for extra security.")
+    print("  Press Enter to skip — your keys will still be protected")
+    print("  by file permissions (only you can read them).")
     print()
 
-    passphrase = getpass.getpass("  Choose a passphrase: ")
-    if not passphrase:
-        print("  Passphrase cannot be empty.")
-        sys.exit(1)
-    confirm = getpass.getpass("  Confirm passphrase: ")
-    if passphrase != confirm:
-        print("  Passphrases don't match. Run 'multi-llm' to try again.")
-        sys.exit(1)
+    passphrase = getpass.getpass("  Choose a passphrase (or press Enter to skip): ")
+    if passphrase:
+        confirm = getpass.getpass("  Confirm passphrase: ")
+        if passphrase != confirm:
+            print("  Passphrases don't match. Run 'multi-llm' to try again.")
+            sys.exit(1)
 
     # Store a check value so we can verify passphrase on login
     check_value = encrypt_key("multi-llm-check", passphrase)
@@ -157,7 +157,8 @@ def setup():
     save_config(cfg)
     print()
     print("  ── Setup complete! ──")
-    print("  Saved %d key(s) to ~/.multi-llm/config.json (encrypted)" % len(cfg["keys"]))
+    protected = "encrypted" if passphrase else "file-protected"
+    print("  Saved %d key(s) to ~/.multi-llm/config.json (%s)" % (len(cfg["keys"]), protected))
     print()
     print("  You're ready to go! Starting chat...")
     print()
@@ -237,7 +238,16 @@ def _add_keys_interactive(cfg, passphrase):
 
 
 def unlock(cfg):
-    """Ask for passphrase and verify it."""
+    """Ask for passphrase and verify it. Skips prompt if no passphrase was set."""
+    # Try empty passphrase first (user skipped during setup)
+    try:
+        check = decrypt_key(cfg["check"], "")
+        if check == "multi-llm-check":
+            return ""
+    except Exception:
+        pass
+
+    # Has a passphrase — ask for it
     passphrase = getpass.getpass("  Passphrase: ")
     try:
         check = decrypt_key(cfg["check"], passphrase)
@@ -427,6 +437,21 @@ def send_message(cfg, passphrase, messages):
 #  MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
+def self_update():
+    """Pull latest changes from the remote repo."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    print("  Updating multi-llm...")
+    ret = subprocess.call(["git", "pull", "origin", "main"], cwd=script_dir)
+    if ret == 0:
+        print("  Up to date!")
+        # Re-install hooks in case they changed
+        setup_sh = os.path.join(script_dir, "setup.sh")
+        if os.path.exists(setup_sh):
+            subprocess.call(["bash", setup_sh], cwd=script_dir)
+    else:
+        print("  Update failed. Check your internet connection.")
+
+
 def print_help():
     print("""
   multi-llm — Pool free API keys for seamless terminal chat
@@ -435,6 +460,7 @@ def print_help():
     multi-llm              Start chatting
     multi-llm --status     Show which keys are available
     multi-llm --add        Add more keys
+    multi-llm --update     Pull latest version from GitHub
     multi-llm --reset      Clear all rate-limit cooldowns
     multi-llm --help       This message
 
@@ -452,6 +478,10 @@ def main():
 
     if "--help" in args or "-h" in args:
         print_help()
+        return
+
+    if "--update" in args:
+        self_update()
         return
 
     cfg = load_config()
