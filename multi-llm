@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-multi-llm — Rotate API keys and launch native CLIs.
-Thin wrapper: swaps keys, runs the real gemini/groq CLI. That's it.
+multi-llm — Rotate Gemini API keys and launch the native Gemini CLI.
+When one key hits its rate limit, exit and re-run — it picks the next key.
 """
 
 import json
@@ -36,130 +36,86 @@ def save_config(cfg):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  SETUP
+#  SETUP (runs once)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def setup():
     print()
     print("  multi-llm — First-Time Setup")
-    print("  ─────────────────────────────")
     print()
-    print("  This tool rotates your free API keys and launches")
-    print("  the real Gemini CLI (or Groq CLI). When one key")
-    print("  runs out, exit and re-run — it picks the next key.")
-    print()
-    print("  You need at least one API key. Both are free:")
-    print()
-    print("    Gemini:  https://aistudio.google.com/apikey")
-    print("      -> Click 'Create API Key' -> copy it (starts with AIza...)")
-    print()
-    print("    Groq:    https://console.groq.com/keys")
-    print("      -> Sign up -> 'Create API Key' -> copy it (starts with gsk_...)")
-    print()
-    print("  Tip: Use multiple Google/Groq accounts for more free usage!")
+    print("  This tool rotates your free Gemini API keys and")
+    print("  launches the real Gemini CLI. When one key runs out,")
+    print("  exit and re-run — it picks the next key automatically.")
     print()
 
-    cfg = {"gemini_keys": [], "groq_keys": [], "cooldowns": {}}
+    cfg = {"keys": [], "cooldowns": {}}
 
     # Auto-detect from environment
-    env_count = 0
     for var in sorted(os.environ.keys()):
         if var.startswith("GEMINI_API_KEY"):
             val = os.environ[var].strip()
             if val:
-                cfg["gemini_keys"].append(val)
-                env_count += 1
-    for var in sorted(os.environ.keys()):
-        if var.startswith("GROQ_API_KEY"):
-            val = os.environ[var].strip()
-            if val:
-                cfg["groq_keys"].append(val)
-                env_count += 1
+                cfg["keys"].append(val)
 
-    if env_count:
-        print("  Found %d key(s) in your environment:" % env_count)
-        print("    %d Gemini, %d Groq" % (len(cfg["gemini_keys"]), len(cfg["groq_keys"])))
-        print()
-        add_more = input("  Add more keys manually? (y/n): ").strip().lower()
+    if cfg["keys"]:
+        print("  Found %d Gemini key(s) in your environment." % len(cfg["keys"]))
     else:
-        add_more = "y"
-
-    if add_more == "y":
+        print("  No keys found in environment.")
+        print()
+        print("  Get a free key: https://aistudio.google.com/apikey")
+        print("    -> Click 'Create API Key' -> copy it (starts with AIza...)")
+        print()
         _add_keys_interactive(cfg)
 
-    total = len(cfg["gemini_keys"]) + len(cfg["groq_keys"])
-    if total == 0:
-        print("  No keys added. Run 'multi-llm' again after getting a key.")
+    if not cfg["keys"]:
+        print("  No keys added. Get one at https://aistudio.google.com/apikey")
         sys.exit(1)
 
     save_config(cfg)
-    print()
-    print("  Saved %d key(s). You're ready — launching now..." % total)
+    print("  Saved %d key(s)." % len(cfg["keys"]))
     print()
     return cfg
 
 
 def _add_keys_interactive(cfg):
-    print()
-    print("  Paste keys one at a time. Press Enter when done.")
+    print("  Paste your Gemini API key(s). Press Enter when done.")
     print()
     while True:
-        print("  [1] Add Gemini key   [2] Add Groq key   [enter] Done")
-        choice = input("  > ").strip()
-
-        if choice == "":
-            if not cfg["gemini_keys"] and not cfg["groq_keys"]:
-                print("  You need at least one key!")
-                continue
+        key = input("  Key (or Enter to finish): ").strip()
+        if not key:
             break
-        elif choice == "1":
-            key = input("  Gemini key (AIza...): ").strip()
-            if key:
-                cfg["gemini_keys"].append(key)
-                print("  Added Gemini key #%d" % len(cfg["gemini_keys"]))
-        elif choice == "2":
-            key = input("  Groq key (gsk_...): ").strip()
-            if key:
-                cfg["groq_keys"].append(key)
-                print("  Added Groq key #%d" % len(cfg["groq_keys"]))
-        else:
-            print("  Type 1, 2, or press Enter.")
-        print()
+        cfg["keys"].append(key)
+        print("  Added key #%d" % len(cfg["keys"]))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  COOLDOWNS
 # ═════════════════════════════════════════════════════════════════════════════
 
-def is_available(cfg, provider, idx):
-    key = "%s:%d" % (provider, idx)
-    ts = cfg.get("cooldowns", {}).get(key, 0)
+def is_available(cfg, idx):
+    ts = cfg.get("cooldowns", {}).get(str(idx), 0)
     return time.time() - ts > COOLDOWN_SECS
 
 
-def mark_limited(cfg, provider, idx):
-    key = "%s:%d" % (provider, idx)
-    cfg.setdefault("cooldowns", {})[key] = time.time()
+def mark_limited(cfg, idx):
+    cfg.setdefault("cooldowns", {})[str(idx)] = time.time()
     save_config(cfg)
 
 
 def status_line(cfg):
-    g_total = len(cfg.get("gemini_keys", []))
-    g_up = sum(1 for i in range(g_total) if is_available(cfg, "gemini", i))
-    q_total = len(cfg.get("groq_keys", []))
-    q_up = sum(1 for i in range(q_total) if is_available(cfg, "groq", i))
-    return "Gemini: %d/%d ready  Groq: %d/%d ready" % (g_up, g_total, q_up, q_total)
+    total = len(cfg.get("keys", []))
+    up = sum(1 for i in range(total) if is_available(cfg, i))
+    return "%d/%d keys ready" % (up, total)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  LAUNCH NATIVE CLI
+#  LAUNCH
 # ═════════════════════════════════════════════════════════════════════════════
 
 def launch_gemini(api_key, extra_args):
     """Launch the real Gemini CLI with this API key. Returns exit code."""
     env = os.environ.copy()
     env["GEMINI_API_KEY"] = api_key
-    # Use fork+exec so gemini fully owns the terminal
     pid = os.fork()
     if pid == 0:
         os.execvpe("gemini", ["gemini"] + extra_args, env)
@@ -169,23 +125,8 @@ def launch_gemini(api_key, extra_args):
         return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
 
 
-def launch_groq(api_key, extra_args):
-    """Launch the real Groq CLI with this API key. Returns exit code."""
-    env = os.environ.copy()
-    env["GROQ_API_KEY"] = api_key
-    # Try groq CLI if installed
-    groq_cmd = "groq"
-    pid = os.fork()
-    if pid == 0:
-        os.execvpe(groq_cmd, [groq_cmd] + extra_args, env)
-        sys.exit(127)
-    else:
-        _, status = os.waitpid(pid, 0)
-        return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
-
-
 # ═════════════════════════════════════════════════════════════════════════════
-#  SELF-UPDATE
+#  MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
 def self_update():
@@ -194,146 +135,83 @@ def self_update():
     ret = subprocess.call(["git", "pull", "origin", "main"], cwd=script_dir)
     if ret == 0:
         print("  Up to date!")
-        setup_sh = os.path.join(script_dir, "setup.sh")
-        if os.path.exists(setup_sh):
-            subprocess.call(["bash", setup_sh], cwd=script_dir)
     else:
-        print("  Update failed. Check your internet connection.")
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ═════════════════════════════════════════════════════════════════════════════
-
-def print_help():
-    print("""
-  multi-llm — Rotate free API keys, launch native CLI
-
-  Usage:
-    multi-llm              Launch Gemini CLI with next available key
-    multi-llm --status     Show which keys are available
-    multi-llm --add        Add more keys
-    multi-llm --update     Pull latest version from GitHub
-    multi-llm --reset      Clear all rate-limit cooldowns
-    multi-llm --help       This message
-
-  Any other flags are passed straight to the Gemini/Groq CLI.
-  Example: multi-llm -p "explain this code"
-
-  When you hit a rate limit, just exit and re-run multi-llm.
-  It automatically picks the next available key.
-""")
+        print("  Update failed.")
 
 
 def main():
-    extra_args = []
-    action = None
-
     args = sys.argv[1:]
-    i = 0
-    while i < len(args):
-        if args[i] in ("--help", "-h"):
-            action = "help"
-        elif args[i] == "--status":
-            action = "status"
-        elif args[i] == "--add":
-            action = "add"
-        elif args[i] == "--update":
-            action = "update"
-        elif args[i] == "--reset":
-            action = "reset"
-        else:
-            extra_args = args[i:]
-            break
-        i += 1
 
-    if action == "help":
-        print_help()
+    # Our flags
+    if args and args[0] in ("--help", "-h"):
+        print("""
+  multi-llm — Rotate Gemini API keys, launch native CLI
+
+  multi-llm              Launch Gemini CLI with next available key
+  multi-llm --status     Show which keys are ready
+  multi-llm --add        Add more keys
+  multi-llm --update     Pull latest version
+  multi-llm --reset      Clear all cooldowns
+
+  Everything else passes to gemini:
+    multi-llm -p "explain this"
+    multi-llm --model gemini-2.5-pro
+""")
         return
 
-    if action == "update":
+    if args and args[0] == "--update":
         self_update()
         return
 
     cfg = load_config()
 
-    if action == "reset":
+    if args and args[0] == "--reset":
         if cfg:
             cfg["cooldowns"] = {}
             save_config(cfg)
             print("  Cooldowns cleared.")
         return
 
-    if action == "status":
-        if cfg:
-            print("  " + status_line(cfg))
-        else:
-            print("  Not set up yet. Run 'multi-llm' first.")
+    if args and args[0] == "--status":
+        print("  " + status_line(cfg) if cfg else "  Not set up. Run 'multi-llm'.")
         return
 
-    if action == "add":
+    if args and args[0] == "--add":
         if not cfg:
-            print("  Not set up yet. Run 'multi-llm' first.")
-            return
+            cfg = {"keys": [], "cooldowns": {}}
         _add_keys_interactive(cfg)
         save_config(cfg)
         return
 
-    # ── First-time setup ──
+    # Pass everything else to gemini
+    extra_args = args
+
+    # First-time setup (only runs once)
     if cfg is None:
         cfg = setup()
 
-    # ── Pick best key and launch ──
-    print("  " + status_line(cfg))
+    # Pick next available key and launch
+    print("  %s" % status_line(cfg))
 
-    # Try Gemini keys first
-    for i, key in enumerate(cfg.get("gemini_keys", [])):
-        if not is_available(cfg, "gemini", i):
+    for i, key in enumerate(cfg.get("keys", [])):
+        if not is_available(cfg, i):
             continue
 
-        print("  Launching Gemini CLI (key #%d)..." % (i + 1))
+        print("  Using key #%d" % (i + 1))
         print()
         exit_code = launch_gemini(key, extra_args)
 
         if exit_code == 0:
-            return  # clean exit
-        else:
-            print()
-            print("  Gemini exited (code %d)." % exit_code)
-            answer = input("  Rate limited? Mark this key and try next? (y/n): ").strip().lower()
-            if answer == "y":
-                mark_limited(cfg, "gemini", i)
-                print("  Key #%d on cooldown for 1h. Trying next..." % (i + 1))
-                continue
             return
 
-    # Try Groq keys
-    for i, key in enumerate(cfg.get("groq_keys", [])):
-        if not is_available(cfg, "groq", i):
-            continue
-
-        print("  Launching Groq CLI (key #%d)..." % (i + 1))
         print()
-        exit_code = launch_groq(key, extra_args)
+        answer = input("  Rate limited? Try next key? (y/n): ").strip().lower()
+        if answer == "y":
+            mark_limited(cfg, i)
+            continue
+        return
 
-        if exit_code == 0:
-            return
-        elif exit_code == 127:
-            print("  Groq CLI not installed. Install it or add more Gemini keys.")
-            return
-        else:
-            print()
-            print("  Groq exited (code %d)." % exit_code)
-            answer = input("  Rate limited? Mark this key and try next? (y/n): ").strip().lower()
-            if answer == "y":
-                mark_limited(cfg, "groq", i)
-                continue
-            return
-
-    # All exhausted
-    print()
-    print("  All keys are on cooldown! Add more or wait.")
-    print("  Run: multi-llm --add")
+    print("  All keys on cooldown! Add more: multi-llm --add")
 
 
 if __name__ == "__main__":
