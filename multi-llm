@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""
+multi-llm — Pool multiple free-tier API keys for seamless terminal chat.
+Supports Gemini and Groq keys. Auto-rotates on rate limit.
+"""
+
+import base64
+import getpass
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.request
+import urllib.error
+
+# ─── paths ───────────────────────────────────────────────────────────────────
+CONFIG_DIR = os.path.expanduser("~/.multi-llm")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+COOLDOWN_SECS = 3600  # 1h cooldown after rate limit
+
+# ─── API endpoints ───────────────────────────────────────────────────────────
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s"
+GEMINI_MODEL = "gemini-2.5-flash"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  KEY ENCRYPTION (simple passphrase-based obfuscation)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _derive_key(passphrase):
+    """Derive a 32-byte key from passphrase using PBKDF2."""
+    return hashlib.pbkdf2_hmac("sha256", passphrase.encode(), b"multi-llm-salt", 100000)
+
+def _xor_bytes(data, key):
+    """XOR data with repeating key."""
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+
+def encrypt_key(api_key, passphrase):
+    """Encrypt an API key with a passphrase."""
+    derived = _derive_key(passphrase)
+    encrypted = _xor_bytes(api_key.encode(), derived)
+    return base64.b64encode(encrypted).decode()
+
+def decrypt_key(encrypted, passphrase):
+    """Decrypt an API key with a passphrase."""
+    derived = _derive_key(passphrase)
+    data = base64.b64decode(encrypted)
+    return _xor_bytes(data, derived).decode()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CONFIG
+# ═════════════════════════════════════════════════════════════════════════════
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return None
+    with open(CONFIG_FILE) as f:
+        return json.load(f)
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(CONFIG_FILE, 0o600)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SETUP
+# ═════════════════════════════════════════════════════════════════════════════
+
+def setup():
+    print()
+    print("  multi-llm — First-Time Setup")
+    print("  ─────────────────────────────")
+    print()
+    print("  Add your API keys. You can mix Gemini and Groq keys.")
+    print("  More keys = more free requests before hitting limits.")
+    print()
+    print("  Get keys:")
+    print("    Gemini: https://aistudio.google.com/apikey")
+    print("    Groq:   https://console.groq.com/keys")
+    print()
+
+    passphrase = getpass.getpass("  Choose a passphrase to encrypt your keys: ")
+    if not passphrase:
+        print("  Passphrase cannot be empty.")
+        sys.exit(1)
+    confirm = getpass.getpass("  Confirm passphrase: ")
+    if passphrase != confirm:
+        print("  Passphrases don't match.")
+        sys.exit(1)
+
+    # Store a check value so we can verify passphrase on login
+    check_value = encrypt_key("multi-llm-check", passphrase)
+
+    cfg = {"keys": [], "cooldowns": {}, "check": check_value}
+
+    print()
+    _add_keys_interactive(cfg, passphrase)
+
+    if not cfg["keys"]:
+        print("  No keys added. Run 'multi-llm' again to set up.")
+        sys.exit(1)
+
+    save_config(cfg)
+    print()
+    print("  Done! %d key(s) saved. Run 'multi-llm' to start." % len(cfg["keys"]))
+    print()
+    return cfg, passphrase
+
+
+def _add_keys_interactive(cfg, passphrase):
+    while True:
+        print("  Key types:  [1] Gemini   [2] Groq   [q] Done")
+        choice = input("  > ").strip().lower()
+
+        if choice in ("q", "quit", "done", ""):
+            break
+        elif choice == "1":
+            provider = "gemini"
+        elif choice == "2":
+            provider = "groq"
+        else:
+            print("  Invalid choice.")
+            continue
+
+        key = getpass.getpass("  Paste %s API key (hidden): " % provider)
+        if not key.strip():
+            continue
+
+        cfg["keys"].append({
+            "provider": provider,
+            "encrypted": encrypt_key(key.strip(), passphrase),
+        })
+        print("  Added %s key #%d" % (provider, sum(1 for k in cfg["keys"] if k["provider"] == provider)))
+        print()
+
+
+def unlock(cfg):
+    """Ask for passphrase and verify it."""
+    passphrase = getpass.getpass("  Passphrase: ")
+    try:
+        check = decrypt_key(cfg["check"], passphrase)
+        if check != "multi-llm-check":
+            raise ValueError()
+    except Exception:
+        print("  Wrong passphrase.")
+        sys.exit(1)
+    return passphrase
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  COOLDOWNS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def is_available(cfg, idx):
+    cooldowns = cfg.get("cooldowns", {})
+    ts = cooldowns.get(str(idx), 0)
+    return time.time() - ts > COOLDOWN_SECS
+
+def mark_limited(cfg, idx):
+    cfg.setdefault("cooldowns", {})[str(idx)] = time.time()
+    save_config(cfg)
+
+def status_line(cfg):
+    gemini_total = sum(1 for k in cfg["keys"] if k["provider"] == "gemini")
+    groq_total = sum(1 for k in cfg["keys"] if k["provider"] == "groq")
+    gemini_up = sum(1 for i, k in enumerate(cfg["keys"]) if k["provider"] == "gemini" and is_available(cfg, i))
+    groq_up = sum(1 for i, k in enumerate(cfg["keys"]) if k["provider"] == "groq" and is_available(cfg, i))
+    return "Gemini: %d/%d  Groq: %d/%d" % (gemini_up, gemini_total, groq_up, groq_total)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CHAT — GEMINI API (streaming)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def gemini_stream(api_key, messages):
+    """Send messages to Gemini and stream the response. Returns (text, error_code)."""
+    # Convert messages to Gemini format
+    contents = []
+    for m in messages:
+        role = "user" if m["role"] == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": m["content"]}]})
+
+    payload = json.dumps({"contents": contents}).encode()
+    url = GEMINI_URL % (GEMINI_MODEL, api_key)
+
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+
+    try:
+        resp = urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            return None, 429
+        body = e.read().decode()[:200]
+        print("  API error (%d): %s" % (e.code, body))
+        return None, e.code
+    except urllib.error.URLError as e:
+        print("  Network error: %s" % e)
+        return None, -1
+
+    # Stream SSE response
+    full_text = []
+    for line in resp:
+        line = line.decode().strip()
+        if not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+            parts = chunk.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            for part in parts:
+                text = part.get("text", "")
+                if text:
+                    print(text, end="", flush=True)
+                    full_text.append(text)
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
+
+    print()
+    return "".join(full_text), 0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CHAT — GROQ API (streaming)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def groq_stream(api_key, messages):
+    """Send messages to Groq and stream the response. Returns (text, error_code)."""
+    payload = json.dumps({
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "stream": True,
+    }).encode()
+
+    req = urllib.request.Request(GROQ_URL, data=payload, headers={
+        "Authorization": "Bearer %s" % api_key,
+        "Content-Type": "application/json",
+    })
+
+    try:
+        resp = urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            return None, 429
+        body = e.read().decode()[:200]
+        print("  API error (%d): %s" % (e.code, body))
+        return None, e.code
+    except urllib.error.URLError as e:
+        print("  Network error: %s" % e)
+        return None, -1
+
+    full_text = []
+    for line in resp:
+        line = line.decode().strip()
+        if not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+            content = chunk["choices"][0].get("delta", {}).get("content", "")
+            if content:
+                print(content, end="", flush=True)
+                full_text.append(content)
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
+
+    print()
+    return "".join(full_text), 0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SEND — tries keys in order, rotates on rate limit
+# ═════════════════════════════════════════════════════════════════════════════
+
+def send_message(cfg, passphrase, messages):
+    """Try each available key until one works. Returns assistant text or None."""
+    for i, entry in enumerate(cfg["keys"]):
+        if not is_available(cfg, i):
+            continue
+
+        api_key = decrypt_key(entry["encrypted"], passphrase)
+
+        if entry["provider"] == "gemini":
+            text, code = gemini_stream(api_key, messages)
+        else:
+            text, code = groq_stream(api_key, messages)
+
+        if code == 0 and text:
+            return text
+        elif code == 429:
+            mark_limited(cfg, i)
+            provider = entry["provider"]
+            remaining = sum(
+                1 for j, k in enumerate(cfg["keys"])
+                if is_available(cfg, j) and j != i
+            )
+            print("  [rate limited — %s key #%d, %d keys left]" % (
+                provider,
+                sum(1 for k in cfg["keys"][:i+1] if k["provider"] == provider),
+                remaining,
+            ))
+            continue
+        else:
+            # Other error — skip this key but don't cooldown
+            continue
+
+    print()
+    print("  All keys exhausted! Wait for cooldowns or add more keys.")
+    print("  Run: multi-llm --add")
+    return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═════════════════════════════════════════════════════════════════════════════
+
+def print_help():
+    print("""
+  multi-llm — Pool free API keys for seamless terminal chat
+
+  Usage:
+    multi-llm              Start chatting
+    multi-llm --status     Show which keys are available
+    multi-llm --add        Add more keys
+    multi-llm --reset      Clear all rate-limit cooldowns
+    multi-llm --help       This message
+
+  First run:
+    Just run 'multi-llm' — it walks you through setup.
+
+  Get free keys:
+    Gemini: https://aistudio.google.com/apikey
+    Groq:   https://console.groq.com/keys
+""")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if "--help" in args or "-h" in args:
+        print_help()
+        return
+
+    cfg = load_config()
+
+    if "--reset" in args:
+        if cfg:
+            cfg["cooldowns"] = {}
+            save_config(cfg)
+            print("  Cooldowns cleared.")
+        return
+
+    if "--status" in args:
+        if cfg:
+            print("  " + status_line(cfg))
+        else:
+            print("  Not set up yet. Run 'multi-llm' first.")
+        return
+
+    if "--add" in args:
+        if not cfg:
+            print("  Not set up yet. Run 'multi-llm' first.")
+            return
+        passphrase = unlock(cfg)
+        _add_keys_interactive(cfg, passphrase)
+        save_config(cfg)
+        return
+
+    # ── First-time setup ──
+    if cfg is None:
+        cfg, passphrase = setup()
+    else:
+        passphrase = unlock(cfg)
+
+    # ── Chat loop ──
+    print()
+    print("  %s" % status_line(cfg))
+    print("  Type a message. 'quit' or Ctrl+C to exit.")
+    print()
+
+    messages = []
+
+    while True:
+        try:
+            user_input = input("\033[1;32m❯\033[0m ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if user_input.strip().lower() in ("quit", "exit", "/quit", "/exit"):
+            break
+
+        if user_input.strip().lower() == "/status":
+            cfg = load_config()  # reload in case cooldowns changed
+            print("  " + status_line(cfg))
+            continue
+
+        if not user_input.strip():
+            continue
+
+        messages.append({"role": "user", "content": user_input})
+        print()
+
+        text = send_message(cfg, passphrase, messages)
+        if text:
+            messages.append({"role": "assistant", "content": text})
+        else:
+            messages.pop()  # remove failed user message
+
+        print()
+
+
+if __name__ == "__main__":
+    main()
