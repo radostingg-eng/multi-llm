@@ -97,11 +97,25 @@ ml --update
 
 Pulls the latest code from GitHub and re-installs hooks.
 
+## Windows Setup
+
+```cmd
+git clone https://github.com/radostingg-eng/multi-llm.git
+cd multi-llm
+pip install -r requirements-dev.txt
+python multi-llm
+```
+
+To make `ml` work from anywhere, add the `multi-llm` folder to your PATH, or create a batch file:
+```cmd
+echo @python "%USERPROFILE%\multi-llm\multi-llm" %* > %USERPROFILE%\ml.bat
+```
+
 ## For Developers
 
 ```bash
 bash setup.sh                     # one-time: hooks + pytest
-python3 -m pytest tests/ -v      # 27 tests
+python3 -m pytest tests/ -v      # 52 tests
 ```
 
 **Quality gates:**
