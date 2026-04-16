@@ -553,6 +553,10 @@ def main():
         print(HELP_TEXT)
         return
 
+    if args and args[0] in ("--version", "-v"):
+        print("  multi-llm 1.0")
+        return
+
     if args and args[0] == "--update":
         self_update()
         return
